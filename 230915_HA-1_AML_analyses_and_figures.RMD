@@ -1,0 +1,703 @@
+---
+title: "HA-1 leukemia escape: analysis and figures"
+author: "Melinda A. Biernacki"
+date: "9-15-2023"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r, warning=FALSE, message=FALSE, warning=FALSE, echo=T}
+graphics.off()
+rm(list=ls())
+#knitr::opts_chunk$set(dev="CairoPNG")
+knitr::opts_chunk$set(fig.width=8, fig.height=6,dpi=300,
+                      echo=TRUE, warning=FALSE, message=FALSE)
+knitr::opts_chunk$set(dev.args=list(bg="transparent"))
+ROOT_DIR<-"~/singlecell/HA-1"
+stem<-"leukemia escape"
+
+# DATA_DIR <- file.path(ROOT_DIR,  stem, "data")      # SPECIFY HERE
+RES_DIR  <- file.path(ROOT_DIR, stem, "res")     # SPECIFY HERE
+RMD_DIR  <- file.path(ROOT_DIR, stem, "rmd")     # SPECIFY HERE
+CDS_DIR <- file.path(ROOT_DIR,  stem, "cds")
+FIG_DIR <- file.path(ROOT_DIR,  stem, "figs")
+
+suppressPackageStartupMessages({
+  library(monocle3)
+  library(openxlsx)  
+  library(dplyr)
+  library(Matrix)
+  library(ggplot2)
+  library(rhdf5)
+  library(xfun)
+  library(pals)
+  library(reticulate)
+  library(RColorBrewer)
+  library(knitr)
+  library(Seurat)
+  library(EnsDb.Hsapiens.v86)
+  library(data.table)
+  library(enrichR)
+  library(scCustomize)
+})
+
+dyn.load('/app/software/ArrayFire/3.8.1/lib64/libaf.so.3')
+library(viewmastR)
+library(GSVA)
+library(GSEABase)
+library(limma)
+library(pheatmap)
+library(ComplexHeatmap)
+
+## Install infercnv 
+# log in to cluster session in terminal
+# ml JAGS/4.3.0-foss-2021b
+# ml fhR/4.2.0-foss-2021b
+# R
+# install.packages('rjags', repos='http://cran.us.r-project.org')
+# BiocManager::install("infercnv")
+#
+# Then inside RStudio (start new session after install)
+dyn.load("/app/software/JAGS/4.3.0-foss-2021b/lib/libjags.so.4")
+library(infercnv)
+
+# reticulate::use_python("/home/mbiernac/.virtualenvs/reticulate/bin/python")
+# library(reticulate)
+# 
+# use_python("/home/mbiernac/.virtualenvs/reticulate/bin/python")
+py_config()
+# py_run_string("import scrublet")
+xfun::pkg_load2(c('base64enc', 'htmltools', 'mime'))
+# py_install("scrublet")
+# py_available("scrublet")
+
+# Set global ggplot2 properties for making print-scaled PDF panels
+SFtheme<-theme_bw(base_size=14) + 
+  theme(panel.background = element_rect(fill = "transparent",colour = NA), # or theme_blank()
+    panel.grid.minor = element_blank(), 
+    panel.grid.major = element_blank(),
+    legend.background = element_rect(fill = "transparent"),
+    legend.box.background = element_rect(fill = "transparent"), 
+    legend.key = element_rect(fill = "transparent", colour = NA),
+    plot.background = element_rect(fill = "transparent",colour = NA))
+theme_set(SFtheme)
+
+exp_colors<-c("grey85", "orange", "red", "violetred4", "black")
+
+lots_color<-function(n){
+  if(n<434){
+  color = grDevices::colors()[grep('gr(a|e)y', grDevices::colors(), invert = T)]
+  sample(color, n)
+  }else{
+    stop("max 433 colors")
+  }
+}
+
+sfc<-function(n, scramble=F){
+  if(!n%%1==0)stop("Please input integer n")
+  ar20<-c("#16482A", "#1C7C40", "#45AC49", "#69BC9A", "#FBD43F", "#E77A2B", "#DC3F32", "#932528", "#50191E", "#96C4D9", "#2394C4", "#4575AD", "#8681B0", "#6C5492", "#8C4A8D", "#9E2563", "#492C74","#E9E52F", "#F8C566", "#D85191")
+  ar10<-ar20[c(1,3,5,7,9,11,13,15,17,20)]
+  ar5<-ar10[c(1,3,6,9,10)]
+  ar4<-ar10[c(2,4,6,8)]
+  if(n>10)funct<-colorRampPalette(ar20)
+  if(n<11 & n>4)funct<-colorRampPalette(ar10)
+  if(n<5 & n>3)funct<-colorRampPalette(ar4)
+  if(n<4)funct<-colorRampPalette(ar5)
+  if(scramble){
+    return(sample(funct(n),n))
+  } else{
+    return(funct(n))
+  }
+}
+pal <- viridis::viridis(n = 10, option = "D")
+pal2 <- viridis::viridis(n = 10, option = "C")
+mcols=c(sfc(16)[c(1:3, 5:16)], "grey70")
+mcols2=c(sfc(16)[c(1:3, 5:16)], "grey60", "grey64", "grey68", "grey72", "grey76", "grey80")
+mcols3=c(sfc(16)[c(1:3, 5, 7:16)], "grey55", "grey60", "grey64", "grey68", "grey72", "grey76", "grey80")
+bmcols=sfc(16)[c(1:3, 5:16)]
+```
+
+## Read in RDS for finding marker genes and making figures
+```{r}
+seu <- readRDS(file.path("/fh/fast/bleakley_m/users/HA-1/leukemia escape/cds/all_myeloid_singleseu_scrubbed_genofixed_malignantannot.RDS"))
+```
+ 
+## Then find marker genes for malignant vs normal equivalents
+```{r}
+# First change Pt ID in "compare" to "malignant" to make same across all samples
+pts <- unique(seu$sample)
+seu$compare[seu$compare %in% pts]<-"Malignant"
+table(seu$compare, seu$malignant)
+
+# Then subset out just malignant and normal in "compare" in seuC object (removes other celltypes)
+seuC <- seu[, seu$compare %in% c("Malignant", "Nml_equivalents")]
+table(seuC$compare, seuC$malignant)
+
+# Then run FindMarkers comparing Malignant (ident.1) to Nml_equivalent (ident.2, reference) for each sample.
+DefaultAssay(seuC)<-"RNA"
+seuC <- SetIdent(seuC, value = "compare")
+Idents(seuC)
+
+pts # Pt ID order is NOT numerical
+malignant_markers <- lapply(pts, function(x){
+  x <- FindMarkers(seuC[, seuC$sample==x],ident.1 = "Malignant", ident.2 = "Nml_equivalents")
+  x <- as.data.frame(x)
+  x$gene <- rownames(x)
+  x
+}) 
+
+# Save to Excel spreadsheet
+options(timeout = 1000)
+dataset_names <- list('Pt5' = malignant_markers[[1]], 'Pt4' = malignant_markers[[2]], 'Pt9' = malignant_markers[[3]], 'Pt2' = malignant_markers[[4]], 'Pt6' = malignant_markers[[5]])
+
+# Export each data frame to separate sheets in same Excel file
+openxlsx::write.xlsx(dataset_names, file = file.path(RES_DIR, "FindMarkers_all_myeloid_clean_data_malig-v-nml.xlsx"))
+```
+
+## Get cell #s
+```{r}
+table(seu$sample)
+table(seu$sample, seu$malignant)
+```
+
+### Now make figures: First, Main Figure 5.
+## UMAPs for Figure 5b-d
+```{r}
+pdf(file.path(FIG_DIR, "Fig5b-c_umap-sample-geno.pdf"), height=8, width=6)
+DimPlot_scCustom(seu, group.by = "sample")
+DimPlot_scCustom(seu, group.by = "geno")
+dev.off()
+
+# Note that the label overlay on Fig 5d was done outside of R
+pdf(file.path(FIG_DIR, "Fig5d_umap-malig.pdf"), height=8, width=7.5)
+DimPlot_scCustom(seu, group.by = "malignant", colors_use = mcols2, label = T)
+dev.off()
+
+```
+
+## Fig 5e (pathways analysis)
+# Running enrichR.
+```{r}
+# Load expression data (Melinda check this, you can probably use malignant_markers)
+path <- file.path(RES_DIR, "FindMarkers_all_myeloid_clean_data_malig-v-nml.xlsx")
+sheets <- openxlsx::getSheetNames(path)
+datl<-lapply(sheets, openxlsx::read.xlsx, xlsxFile=path)
+datl[[1]]
+sig_genes<-lapply(datl, function(df)  df$gene[df$p_val_adj<0.05 & df$avg_log2FC>0.5])
+
+## sig_down_genes<-lapply(datl, function(df)  df$gene[df$p_val_adj<0.05 & df$avg_log2FC<(-0.5)])  # to test for shared downreg pathways use log2FC < -0.5
+
+# dbs <- listEnrichrDbs()
+# dbs$libraryName
+
+db<-"GO_Biological_Process_2021"
+enriched <- lapply(sig_genes, function(genes) enrichr(genes, db))
+
+recursive_intersect<-function(list_of_dataframes, dataframe_column){
+  list_of_data<-lapply(list_of_dataframes, function(df) df[[dataframe_column]])
+  output<-list_of_dataframes[[1]][[dataframe_column]]
+  if(length(list_of_dataframes)>1){
+      for(i in 2:length(list_of_dataframes)){
+        output<-intersect(output, list_of_dataframes[[i]][[dataframe_column]])
+  }
+  }
+  output
+}
+
+# Apply significance threshold
+library(igraph)
+pd<-lapply(enriched, function(df) data.frame(term=df[[1]]$Term, pval=df[[1]][["Adjusted.P.value"]], genes=df[[1]][["Genes"]]))
+thresh<-1e-2
+pds<-lapply(pd, function(df) df[df$pval<thresh,])
+pds[[1]]
+```
+
+## Find pathways common across multiple patients
+```{r}
+# Identify pathways common to all 5 patients
+common_pw<-recursive_intersect(pds, "term")
+
+# After finding common_pw start here again
+pdc<-lapply(pds, function(df) df[df$term %in% common_pw,])
+mean_p_vals<-lapply(common_pw, function(pw){
+  pw_p<-vector()
+  for(i in 1:length(pdc)){
+    pw_p<-c(pw_p, pdc[[i]]$pval[pdc[[i]]$term %in% pw])
+  }
+  mean(pw_p)
+}) %>% unlist
+
+common_genes<-lapply(common_pw, function(pw){
+  genes<-vector()
+  for(i in 1:length(pdc)){
+    genes_pw<-pdc[[i]]$genes[pdc[[i]]$term %in% pw] %>% strsplit(";") %>% unlist()
+    genes<-c(genes, genes_pw)
+  }
+  genes
+}) 
+
+sim_mat<-vector()
+for(i in 1:length(common_pw)){
+  for(j in 1:length(common_pw)){
+    sim_mat<-c(sim_mat, length(which(common_genes[[i]] %in% common_genes[[j]])))
+  }
+}
+adj_matrix<-matrix(sim_mat, nrow = length(common_pw))
+```
+
+## Assemble new data.frame to make network plot in Fig 5e.
+```{r}
+combined_dat<-data.frame(term=common_pw, mean_pval=mean_p_vals)
+nrow(combined_dat)
+g<-graph_from_adjacency_matrix(
+  adj_matrix,
+  mode = c("undirected"),
+  weighted = T,
+  diag = F,
+  add.colnames = NULL,
+  add.rownames = NA
+)
+```
+
+# Make Figure 5e.
+```{r}
+R<-c("red")
+G1<-c("grey90")
+G2<-c("grey80")
+G3<-c("grey70")
+Y<-c("yellow")
+YG<-c("yellowgreen")
+B<-c("lightblue")
+
+pal<-c(B,B,B,G2,G1,G1,G2,G3,G2,G3,YG,G2,R,YG,G2,R,G1,R,YG,G2,G2,G3)
+
+# Figure
+pdf("Fig5e_enriched_up-genes_network.pdf", height=8, width=7.5)
+plot(g, vertex.color=pal, vertex.size= -log(combined_dat$mean_pval)*2, edge.width=edge.betweenness(g)/3)
+dev.off()
+
+# List of enriched pathways
+print(paste0(1:length(common_pw), "_", common_pw))
+```
+
+# Increase stringency of p-value threshold and look at top pathway enrichment genes
+```{r}
+thresh<-1e-5
+pds<-lapply(pd, function(df) df[df$pval<thresh,])
+common_pw<-recursive_intersect(pds, "term")
+pdc<-lapply(pds, function(df) df[df$term %in% common_pw,])
+mean_p_vals<-lapply(common_pw, function(pw){
+  pw_p<-vector()
+  for(i in 1:length(pdc)){
+    pw_p<-c(pw_p, pdc[[i]]$pval[pdc[[i]]$term %in% pw])
+  }
+  mean(pw_p)
+}) %>% unlist
+
+# Identify and return vector of genes from enriched pathways using stringent threshold found in any patient
+common_genes_any<-lapply(common_pw, function(pw){
+  genes<-vector()
+  for(i in 1:length(pdc)){
+    genes_pw<-pdc[[i]]$genes[pdc[[i]]$term %in% pw] %>% strsplit(";") %>% unlist()
+    genes<-c(genes, genes_pw)
+  }
+  genes
+}) 
+
+gene_list_any<-intersect(unlist(common_genes_any[1]), unlist(common_genes_any[2]))
+
+# Identify and return vector of genes from enriched pathways using stringent threshold found in all patients
+common_genes_all<-lapply(common_pw, function(pw){
+  genes<-pdc[[1]]$genes[pdc[[1]]$term %in% pw] %>% strsplit(";") %>% unlist()
+  for(i in 2:length(pdc)){
+    genes_pw<-pdc[[i]]$genes[pdc[[i]]$term %in% pw] %>% strsplit(";") %>% unlist()
+    genes<-intersect(genes, genes_pw)
+  }
+  genes
+}) 
+
+gene_list_all<-intersect(unlist(common_genes_all[1]), unlist(common_genes_all[2]))
+```
+
+## Fig 5f PCA plots
+```{r}
+# Make PC plots of pre/post with shared genes
+seuS <- RunPCA(seuS, features = gene_list_any, npcs = 5, approx = F)
+
+seuS$pt_time <- colnames(seuS)
+DimPlot(seuS, group.by = "pt_time", pt.size = 2) + theme_bw()
+
+seuS$timepoint <- seuS$pt_time
+seuS$timepoint[grep("_01PRE", seuS$timepoint)] <- "Pre-infusion"
+seuS$timepoint[grep("_D", seuS$timepoint)] <- "Post-infusion"
+p1 <- DimPlot(seuS, group.by = "timepoint", pt.size = 2) + theme_bw()
+
+seuS$patient <- seuS$pt_time
+seuS$patient <- substr(seuS$patient, 1, 3)
+p2 <- DimPlot(seuS, group.by = "patient", pt.size = 2) + theme_bw()
+
+# Used these plots to recolor and label final figure plot outside of R
+p1|p2
+
+
+# Note that this plot was modified (color coding, labels, arrows) outside of R for clarity
+pdf(file.path(FIG_DIR, "FigG_shared-genes_pre-post-pts_just-time_PCplot.pdf"), height=4.5, width=6)
+p1
+dev.off()
+```
+
+## Then shared genes and dot plots for Figure 5g
+# First, get stats for shared death gene expression in post vs pre:
+```{r}
+# Make seuM (just pre/post patients) and rename timepoints to pre/post
+seuM <- seu[, seu$malignant %in% c("Pt4", "Pt6", "Pt9")]
+seuM$timepoint[grep("_01PRE", seuM$timepoint)] <- "Preinfusion"
+seuM$timepoint[grep("_D", seuM$timepoint)] <- "Postinfusion"
+table(seuM$timepoint)
+
+# Run FindMarkers comparing Malignant (ident.1) to Nml_equivalent (ident.2, reference) for each sample to get stats for refined genes
+DefaultAssay(seuM)<-"RNA"
+seuM <- SetIdent(seuM, value = "timepoint")
+
+pp_pts <- unique(seuM$sample)
+
+death_genes_stats <- lapply(pp_pts, function(x){
+  x <- FindMarkers(seuM[, seuM$sample==x],ident.1 = "Postinfusion", ident.2 = "Preinfusion", features = gene_list_any, logfc.threshold = 0.001, min.pct = 0.01)
+  x <- as.data.frame(x)
+  x$gene <- rownames(x)
+  x
+}) 
+
+# Save to Excel spreadsheet
+options(timeout = 1000)
+stats_sheets_names2 <- list('Pt4_shared' = death_genes_stats[[1]], 'Pt9_shared' = death_genes_stats[[2]], 'Pt6_shared' = death_genes_stats[[3]])
+
+# Export each data frame to separate sheets in same Excel file
+openxlsx::write.xlsx(stats_sheets_names2, file = file.path(RES_DIR, "Stats_shared-death-genes_myeloid-prepost_clean_post-v-pre.xlsx"))
+
+```
+
+# Then make Fig 5g dot plots from top death genes: 
+```{r}
+# Simplify timepoint metadata
+seuC$time <- seuC$timepoint
+seuC$time[grep("_01PRE", seuC$time)] <- "Preinfusion"
+seuC$time[grep("_D", seuC$time)] <- "Postinfusion"
+table(seuC$time, seuC$timepoint)
+
+# Make new metadata combining pt ID and malignant/nml equivalent info
+seuC$compare_time<-paste0(seuC$compare, "_", seuC$time)
+table(seuC$compare_time)
+
+# Genes shared in all 5 patients from pathways analysis
+gene_list_all
+
+# Subset data to include only patients with pre/post samples & only malignant cells & normal equivalents
+seuC_save <- seuC
+seuC<-seu[, seu$sample %in% c("Pt4", "Pt6", "Pt9")]
+seuC<-seuC[, seuC$compare %in% c("Malignant", "Nml_equivalents")]
+
+# Simplify timepoint & compare metadata
+seuC$timepoint[grep("_01PRE", seuC$timepoint)] <- "01_Preinfusion"
+seuC$timepoint[grep("_D", seuC$timepoint)] <- "02_Postinfusion"
+seuC$compare[grep("Nml_equivalents", seuC$compare)] <- "Normal"
+seuC$compare[grep("Malignant", seuC$compare)] <- "Malignant"
+
+table(seuC$compare)
+
+# Add metadata that combines sample, timepoint, and malignant/normal
+seuC$compare_time <- paste0(seuC$sample, "_", seuC$timepoint, "_", seuC$compare)
+
+# Make plot. Note that the x-axis labels of this plot were modified outside of R, and boxes were added. Statistical information was added from analysis in above chunk. 
+pdf(file.path(FIG_DIR, "Shared-death-genes_as_DotPlots.pdf"), height=10, width=10)
+DotPlot_scCustom(seuC, features = gene_list_all, group.by = "compare_time", colors_use = viridis_light_high)+coord_flip()+ theme(axis.text.x = element_text(angle = 45, hjust=1))
+dev.off()
+
+```
+
+
+### Extended Data Figure 6
+## Corroborate cell type annotations and make Extended Data Figure 6a
+```{r}
+## Find marker genes for cell types as annotated
+Idents(seu) <- seu$celltype
+celltype_markers <- FindAllMarkers(seu)
+
+celltype_markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> top10
+top10
+print(top10, n = 150)
+
+celltype_markers %>%
+    group_by(cluster) %>%
+    top_n(n = 2, wt = avg_log2FC) -> top2
+print(top2, n = 30)
+
+# Save marker genes to Excel spreadsheet
+options(timeout = 1000)
+openxlsx::write.xlsx(celltype_markers, file = file.path(RES_DIR, "Celltype_annotations_FindAllMarkers.xlsx"))
+
+## ED Fig 6a violin plots of expression of key marker genes by cell type
+key_genes <- c("CD34", "TIMP3", "HBA2", "CD33", "DNTT", "LILRA4", "CD1C", "CD14", "C1QA", "RAG2", "CD19", "SDC1", "CD3D", "FCGR3A") # take out CD20 aka MS4A1?
+
+pdf(file.path(FIG_DIR, "EDFig6a_key_genes_celltypes_violins.pdf"), height=7, width=7)
+Stacked_VlnPlot(seu, group.by = "celltype", features = key_genes, x_lab_rotate = T, colors_use = mcols2)
+dev.off()
+```
+
+## Run inferCNV & visualize for Extended Data Figure 6b
+```{r}
+DefaultAssay(seu)<-"RNA"
+
+# inferCNV workflow (https://github.com/broadinstitute/inferCNV/wiki)
+genes<-read.csv(file.path("~/singlecell/public_datasets/gene_pos_hg38.csv"))
+genes<-genes[complete.cases(genes),]
+genes$symbol<-make.unique(genes$symbol)
+genes<-genes[genes$symbol %in% rownames(seu),]
+
+#choose a random subset of cells to run faster. Target is 10000, use 1000 while troubleshooting.
+tocnv<-seu[, sample(1:ncol(seu), 15000)]
+tocnv<-tocnv[genes$symbol,]
+dim(tocnv)
+dim(genes)
+rownames(genes)<-genes$symbol
+genes$X<-NULL
+genes$symbol<-NULL
+genes$ensid<-NULL
+levels(factor(genes$seq))
+
+# Get subsample with max representation of clusters up to threshold of 2000 cells
+indices<-1:dim(tocnv)[2]
+DimPlot(tocnv, cols = mcols2, group.by = "malignant")
+tocnv$cluster<-as.character(tocnv$malignant)
+tocnv$infercnv<-factor(tocnv$cluster)
+DimPlot(tocnv, group.by =  "infercnv")+SFtheme+scale_color_manual(values=mcols2)
+
+# Since all patients have myeloid malignancies and T cells should be donor origin, use T cells ("14_T") as reference.
+infercnv_obj <- infercnv::CreateInfercnvObject(raw_counts_matrix=as.matrix(tocnv@assays$RNA[, indices]), 
+                                               gene_order_file=genes,
+                                               annotations_file=data.frame(tocnv$infercnv[indices], row.names=rownames(tocnv@meta.data)[indices]),
+                                               ref_group_names="14_T", 
+                                               chr_exclude = levels(factor(genes$seq))[!levels(factor(genes$seq)) %in% paste0("chr", as.character(1:22))])
+sapply(infercnv_obj@reference_grouped_cell_indices, length)
+sapply(infercnv_obj@observation_grouped_cell_indices, length)
+dir.create(file.path(RES_DIR, "all_myeloid_pts_inferCNV"))
+out_dir = file.path(RES_DIR, "all_myeloid_pts_inferCNV")
+
+## Save tocnv as it changes with every run Once run successfully, you can delete.
+saveRDS(tocnv, file.path(CDS_DIR, "232004_infercnv_run_tocnv.RDS"))
+
+infercnv_obj_default = infercnv::run(
+    infercnv_obj,
+    cutoff=0.1, # cutoff=0.1 works well for 10x Genomics
+    out_dir=out_dir,
+    cluster_by_groups=TRUE, 
+    plot_steps=TRUE,
+    denoise=TRUE,
+    HMM=TRUE, save_rds = T,
+    no_prelim_plot=FALSE,
+    png_res=240, num_threads = 4
+)
+
+knitr::include_graphics(paste(out_dir, "infercnv.png", sep="/"))
+DimPlot(tocnv, group.by =  "infercnv",)+SFtheme+scale_color_manual(values=mcols2)
+
+row.names(tocnv@meta.data)
+colnames(infercnv_obj@expr.data)
+
+dim(tocnv)
+dim(infercnv_obj@expr.data)
+
+# Find cells in both tocnv and infercnv_obj; will not always be the same.
+cells_in_both<-row.names(tocnv@meta.data)[which(row.names(tocnv@meta.data) %in% colnames(infercnv_obj@expr.data))]
+
+tocnv1 = infercnv::add_to_seurat(infercnv_output_path=file.path(RES_DIR, "all_myeloid_pts_inferCNV"), seurat_obj=tocnv)
+
+tocnv1 <- infercnv::add_to_seurat(
+  seurat_obj = tocnv[,cells_in_both],
+  infercnv_output_path= file.path(RES_DIR, "all_myeloid_pts_inferCNV"))
+
+#saveRDS(tocnv1, file.path(CDS_DIR, "all_myeloid_pts_inferCNV_tocnv1.RDS"))
+tocnv1<-readRDS(file.path(CDS_DIR, "all_myeloid_pts_inferCNV_tocnv1.RDS"))
+
+## ED Fig 6b: inferCNV data as ridge plot showing loss of chr5 in patients 4 & 6 and loss of chr7 in patient 2.
+pdf(file.path(FIG_DIR, "EDFig6b_inferCNV_ridgeplots.pdf"), height=5, width=10)
+RidgePlot(tocnv1, features = "proportion_loss_chr5", group.by = "malignant") & scale_fill_manual(values = mcols2) & theme(legend.position = "none")|RidgePlot(tocnv1, features = "proportion_loss_chr7", group.by = "malignant") & scale_fill_manual(values = mcols2) & theme(axis.text.y = element_blank(), axis.title.y = element_blank())
+dev.off()
+
+```
+
+## Visualize patient 5 with mutation data for Extended Data Figure 6c
+```{r}
+# Show U2AF1 mutation status in Pt5 malignant cells. Note the legends were modified outside of R
+
+# UMAP with all patient cells for reference (as in Main Fig 5c)
+p1 <- DimPlot_scCustom(seu, group.by = "malignant", colors_use = mcols2, pt.size = 0.4) & theme(legend.position = "none", axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank(), axis.title = element_blank())
+
+# Make new metadata to only highlight U2AF1 genotype in Pt5 malignant cells, then only in central cluster, removing cells in late erythroids that are possible doublets 
+seu$u2af1_470A_G_malig <- seu$U2AF1_470A_G
+seu$u2af1_101C_T_malig <- seu$U2AF1_101C_T
+
+seu$u2af1_470A_G_malig[seu$sample!="Pt5"] <- "Other"
+seu$u2af1_101C_T_malig[seu$sample!="Pt5"] <- "Other"
+
+# Make mutation plots
+p2 <- DimPlot_scCustom(seu, group.by = "u2af1_470A_G_malig", pt.size = 0.6, order = c("3_mutant", "2_biallelic", "1_ref", "undetermined", "Other"))+ scale_color_manual(values=exp_colors, na.value = "#CCCCCC0D")+ theme(legend.position = "none", axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank(), axis.title = element_blank())
+p3 <- DimPlot_scCustom(seu, group.by = "u2af1_101C_T_malig", pt.size = 0.6, order = c("3_mutant", "2_biallelic", "1_ref", "undetermined", "Other"))+ scale_color_manual(values=exp_colors, na.value = "#CCCCCC0D")+ theme(legend.position = "none", axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank(), axis.title = element_blank())
+
+pdf(file.path(FIG_DIR, "EDFig6c_pt5_U2AF1_muts.pdf"), height=5, width=15)
+p1|p2|p3
+dev.off()
+```
+
+
+### Extended Data Figure 7
+## ED Fig 7a: anti-death gene module score change over time
+```{r}
+# Add anti-death genes module score to examine expression of all 138 anti-death genes found in at least 1 patient from pathways analysis
+seu <- AddModuleScore(seu, features = shared_genes, name = "antideath_genes")
+
+# Subset out only patients with pre/post samples to examine change in module over time
+seuM <- seu[, seu$sample %in% c("Pt4", "Pt6", "Pt9")]
+seuM$timepoint[grep("_01PRE", seuM$timepoint)] <- "Pre-infusion"
+seuM$timepoint[grep("_D", seuM$timepoint)] <- "Post-infusion"
+
+# Visualize module score
+FeaturePlot_scCustom(seuM, features = "antideath_genes1", split.by = "timepoint", colors_use = viridis_magma_light_high, pt.size = 0.5)
+
+# Find median and mean of antideath gene module scores to help clean up visualization
+median(seuM$antideath_genes1)
+mean(seuM$antideath_genes1)
+min(seuM$antideath_genes1)
+
+# Because normal cells (esp. lymphocytes) have high death gene scores that confuse the visualization, give nonmalignant cells anti-death gene score of NA
+seuM$antideath_gene_score <- seuM$antideath_genes1
+seuM$antideath_gene_score[!seuM$malignant %in% c("Pt4", "Pt6", "Pt9")] <- NA
+
+# Make figure with na_cutoff
+pdf(file.path(FIG_DIR, "EDFig7a_deathgenesmodule_pre-post.pdf"), height=12, width=4)
+FeaturePlot_scCustom(seuM, features = "antideath_gene_score", split.by = "timepoint", colors_use = viridis_inferno_light_high, na_cutoff = -0.5, pt.size = 0.5)
+dev.off()
+
+```
+
+## ED Fig 7b: heatmap of 151 putative immune escape-related genes
+```{r}
+# Get average expression for only malignant cells (in malignant as pt IDs) by timepoint only for patients with pre/post
+seuS<-AverageExpression(seu[, seu$malignant %in% c("Pt4", "Pt6", "Pt9")], assays = "RNA", return.seurat = T, slot = "counts", group.by = "timepoint")
+mat<-as.matrix(seuS@assays$RNA@counts)
+pmat<-mat[rowSums(mat)>0,]
+dim(pmat)
+
+# Read in putative immune escape genes table as df then save gene names as vector
+df<-read.xlsx(file.path(RES_DIR, "Putative_immune_escape_genes.xlsx"))
+genes <- unique(df$gene)
+
+# Make heatmap with all genes
+found <- genes[genes %in% rownames(pmat)]
+ppmat <- pmat[found,]
+pheatmap::pheatmap(ppmat, scale = "row", color = colorRampPalette(c("darkblue", "blue", "lightyellow", "red", "darkred"))(100), fontsize_row = 6, fontsize_col = 10, cluster_cols = F, cluster_rows = T, main = "All immune escape genes", filename = file.path(FIG_DIR, "EDFig7b_heatmap_all_151_immune_escape_genes.pdf"), height = 10)
+```
+
+## ED Fig 7c-d: dot plots of biologically relevant shared putative immune escape-related genes
+```{r}
+## Get stats for key genes pre-/post-expression
+seuC <- seu[, seu$compare %in% c("Malignant", "Nml_equivalents")]
+
+# Simplify timepoint metadata
+seuC$time <- seuC$timepoint
+seuC$time[grep("_01PRE", seuC$time)] <- "Preinfusion"
+seuC$time[grep("_D", seuC$time)] <- "Postinfusion"
+table(seuC$time, seuC$timepoint)
+
+# Subset out only pre/post patients
+pp_pts <- c("Pt4", "Pt6", "Pt9")
+seuP <- seuC[, seuC$compare=="Malignant"]
+
+# Read in refined list genes (shared increased expression post vs pre, biologically relevant change)
+df<-read.xlsx(file.path(RES_DIR, "Refined_list_putative_immune_escape_genes.xlsx"))
+refined_genes <- unique(df$gene)
+
+# Run FindMarkers to get post/pre stats on refined gene list
+seuP <- SetIdent(seuP, value = "sample")
+key_immesc_gene_stats <- lapply(pp_pts, function(x){
+  x <- FindMarkers(seuP[, seuP$sample==x],ident.1 = "Postinfusion", ident.2 = "Preinfusion", features = refined_genes, logfc.threshold = 0.001, min.pct = 0.01)
+  x <- as.data.frame(x)
+  x$gene <- rownames(x)
+  x
+}) 
+
+# Save to Excel spreadsheet
+options(timeout = 1000)
+stats_sheets_names2 <- list('Pt4' = key_immesc_gene_stats[[1]], 'Pt6' = key_immesc_gene_stats[[2]], 'Pt9' = key_immesc_gene_stats[[3]])
+
+# Export each data frame to separate sheets in same Excel file
+openxlsx::write.xlsx(stats_sheets_names2, file = file.path(RES_DIR, "Stats_select-genes_SDFig7b_pre-post.xlsx"))
+
+# Load list of pre-/post-significant genes
+pre_post_sig_genes <- c("BIRC6", "CD47", "CD74", "CFLAR", "DDIT4", "LGALS1", "SLC3A2", "SOX4", "TGFB1")
+
+# Subset out patients w/o pre and post samples
+seuG <- seuP[, seuP$sample %in% pp_pts]
+
+# Make new metadata to order x-axis values properly
+seuG$pt_time <- paste0(seuG$sample, "_", seuG$time)
+seuG$pt_time <- gsub("Preinfusion", "A", seuG$pt_time)
+seuG$pt_time <- gsub("Postinfusion", "B", seuG$pt_time)
+table(seuG$pt_time)
+
+# Make plot
+pdf(file.path(FIG_DIR, "SDFig7b_sig_imm-escape-genes_pre-post_as_DotPlots.pdf"), height=6, width=8)
+DotPlot(seuG, features = pre_post_sig_genes, group.by = "pt_time", cols = c("gray60", "#FF0000"), scale = F) + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + coord_flip()
+dev.off()
+
+# Now make plots of malignant vs normal for all 5 patients
+# Set up metadata
+seuC$pt_compare <- paste0(seuC$sample, "_", seuC$compare)
+seuC$pt_compare <- gsub("Ma", "2_", seuC$pt_compare)
+seuC$pt_compare <- gsub("Nm", "1_", seuC$pt_compare)
+
+# Make plots
+pdf(file.path(FIG_DIR, "SDFig7c_sig_imm-escape-genes_malig-nml_dotplots.pdf"), height=6, width=12)
+DotPlot(seuC, features = pre_post_sig_genes, group.by = "pt_compare", cols = c("gray60", "#FF0000"), scale = F, cluster.idents = F) + theme(axis.text.x = element_text(angle = 45, hjust = 1)) + coord_flip()
+dev.off()
+
+# Run FindMarkers to get stats on malignant vs normal
+seuC <- SetIdent(seuC, value = "compare")
+FindMarkers(seuC[, seuC$sample=="Pt5"],ident.1 = "Malignant", ident.2 = "Nml_equivalents", features = pre_post_sig_genes, logfc.threshold = 0.001, min.pct = 0.01)
+```
+
+## Extended Data Figure 7e-f
+```{r}
+## ED Fig 7e HLA-A expression
+pdf(file.path(FIG_DIR, "EDFig7e_umap-HLA-A.pdf"), height=8, width=7.5)
+FeaturePlot_scCustom(seu, features = "HLA-A")
+dev.off()
+
+## ED Fig 7f ARHGAP45 (HMHA-1) expression
+# Add new meta.data "code" to order categories in violin plot
+seuC$code <- seuC$compare
+seuC$code <- gsub("Nml_equivalents", "A", seuC$code)
+seuC$code <- gsub("Malignant", "B", seuC$code)
+
+pdf(file.path(FIG_DIR, "EDFig7f_violin-ARHGAP45.pdf"), height=8, width=7.5)
+VlnPlot(seuC, features = "ARHGAP45", group.by = "sample", split.by = "code", cols = c("blue", "red"))
+dev.off()
+seuC$code <- NULL
+
+# This plot corroborates that the data being plotted above corresponds to a split by Malignant and Nml_equiv
+VlnPlot(seuC, features = "ARHGAP45", group.by = "sample", split.by = "compare", cols = c("red", "blue"))
+```
+
+
+### Appendix
+```{r Appendix,echo=FALSE}
+sessionInfo()
+getwd()
+```

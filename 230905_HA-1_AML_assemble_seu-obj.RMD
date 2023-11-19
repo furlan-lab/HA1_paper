@@ -1,0 +1,482 @@
+---
+title: "HA-1 leukemia escape: make cleaned Seurat object with genotype, annotation, etc"
+author: "mab"
+date: "9-5-2023"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r, warning=FALSE, message=FALSE, warning=FALSE, echo=T}
+graphics.off()
+rm(list=ls())
+#knitr::opts_chunk$set(dev="CairoPNG")
+knitr::opts_chunk$set(fig.width=8, fig.height=6,dpi=300,
+                      echo=TRUE, warning=FALSE, message=FALSE)
+knitr::opts_chunk$set(dev.args=list(bg="transparent"))
+ROOT_DIR<-"~/singlecell/HA-1"
+stem<-"leukemia escape"
+
+# DATA_DIR <- file.path(ROOT_DIR,  stem, "data")      # SPECIFY HERE
+RES_DIR  <- file.path(ROOT_DIR, stem, "res")     # SPECIFY HERE
+RMD_DIR  <- file.path(ROOT_DIR, stem, "rmd")     # SPECIFY HERE
+CDS_DIR <- file.path(ROOT_DIR,  stem, "cds")
+FIG_DIR <- file.path(ROOT_DIR,  stem, "figs")
+
+suppressPackageStartupMessages({
+  library(monocle3)
+  library(openxlsx)  
+  library(dplyr)
+  library(Matrix)
+  library(ggplot2)
+  library(rhdf5)
+  library(xfun)
+  library(pals)
+  library(reticulate)
+  library(RColorBrewer)
+  library(knitr)
+  library(Seurat)
+  #library(Signac)
+  library(EnsDb.Hsapiens.v86)
+  library(dplyr)
+  library(scCustomize)
+})
+
+dyn.load('/app/software/ArrayFire/3.8.1/lib64/libaf.so.3')
+library(viewmastR)
+library(GSVA)
+library(GSEABase)
+library(limma)
+library(pheatmap)
+library(ComplexHeatmap)
+
+## Install infercnv 
+# log in to cluster session in terminal
+# ml JAGS/4.3.0-foss-2021b
+# ml fhR/4.2.0-foss-2021b
+# R
+# install.packages('rjags', repos='http://cran.us.r-project.org')
+# BiocManager::install("infercnv")
+#
+# Then inside RStudio (start new session after install)
+dyn.load("/app/software/JAGS/4.3.0-foss-2021b/lib/libjags.so.4")
+library(infercnv)
+
+# reticulate::use_python("/home/mbiernac/.virtualenvs/reticulate/bin/python")
+# library(reticulate)
+# 
+# use_python("/home/mbiernac/.virtualenvs/reticulate/bin/python")
+py_config()
+# py_run_string("import scrublet")
+xfun::pkg_load2(c('base64enc', 'htmltools', 'mime'))
+# py_install("scrublet")
+# py_available("scrublet")
+
+# Set global ggplot2 properties for making print-scaled PDF panels
+SFtheme<-theme_bw(base_size=14) + 
+  theme(panel.background = element_rect(fill = "transparent",colour = NA), # or theme_blank()
+    panel.grid.minor = element_blank(), 
+    panel.grid.major = element_blank(),
+    legend.background = element_rect(fill = "transparent"),
+    legend.box.background = element_rect(fill = "transparent"), 
+    legend.key = element_rect(fill = "transparent", colour = NA),
+    plot.background = element_rect(fill = "transparent",colour = NA))
+theme_set(SFtheme)
+
+exp_colors<-c("grey85", "orange", "red", "violetred4", "black")
+
+lots_color<-function(n){
+  if(n<434){
+  color = grDevices::colors()[grep('gr(a|e)y', grDevices::colors(), invert = T)]
+  sample(color, n)
+  }else{
+    stop("max 433 colors")
+  }
+}
+
+sfc<-function(n, scramble=F){
+  if(!n%%1==0)stop("Please input integer n")
+  ar20<-c("#16482A", "#1C7C40", "#45AC49", "#69BC9A", "#FBD43F", "#E77A2B", "#DC3F32", "#932528", "#50191E", "#96C4D9", "#2394C4", "#4575AD", "#8681B0", "#6C5492", "#8C4A8D", "#9E2563", "#492C74","#E9E52F", "#F8C566", "#D85191")
+  ar10<-ar20[c(1,3,5,7,9,11,13,15,17,20)]
+  ar5<-ar10[c(1,3,6,9,10)]
+  ar4<-ar10[c(2,4,6,8)]
+  if(n>10)funct<-colorRampPalette(ar20)
+  if(n<11 & n>4)funct<-colorRampPalette(ar10)
+  if(n<5 & n>3)funct<-colorRampPalette(ar4)
+  if(n<4)funct<-colorRampPalette(ar5)
+  if(scramble){
+    return(sample(funct(n),n))
+  } else{
+    return(funct(n))
+  }
+}
+pal <- viridis::viridis(n = 10, option = "D")
+pal2 <- viridis::viridis(n = 10, option = "C")
+mcols=c(sfc(16)[c(1:3, 5:16)], "grey70")
+mcols2=c(sfc(16)[c(1:3, 5:16)], "grey60", "grey64", "grey68", "grey72", "grey76", "grey80")
+mcols3=c(sfc(16)[c(1:3, 5, 7:16)], "grey55", "grey60", "grey64", "grey68", "grey72", "grey76", "grey80")
+bmcols=sfc(16)[c(1:3, 5:16)]
+```
+
+## Load data and make Seurat object
+```{r}
+# Set DATA_DIRS
+DATA_DIRS <- list.files(file.path(ROOT_DIR, stem, "data", "patients"), full.names = T)
+DATA_DIRS <- file.path(DATA_DIRS, "data")
+
+# Read 10x_h5 files, make list of Seurat objects (seus), and do basic QC 
+seus<- lapply(as.list(DATA_DIRS), function(DATA_DIR) {
+  message(paste0("analyzing directory: ", DATA_DIR))
+  samples <- substr(DATA_DIR, 57, 59)
+  dirs<-list.files(DATA_DIR)
+  merge<-dirs[grep("merge", dirs)]
+  dirs<-dirs[!dirs %in% merge] # Remove merge folder
+  dirs<-dirs[dirs!="D380W"]
+  fileroot<-file.path(DATA_DIR, "SAMPLE/outs/per_sample_outs/SAMPLE/count/sample_feature_bc_matrix.h5")
+  files<-sapply(dirs, function(dir) gsub("SAMPLE", dir, fileroot))
+  seus<-lapply(files, function(i) Read10X_h5(i))
+  gc()
+  if(class(seus[[1]])=="list"){
+    seuG <- lapply(seus, function(i) CreateSeuratObject(counts = i$`Gene Expression`, project = samples))
+
+  }else{
+    seuG<-lapply(seus, function(i) CreateSeuratObject(counts = i, project = samples))
+    # protein=FALSE
+  }
+  
+  seu <- merge(
+    x = seuG[[1]],
+    y = seuG[2:length(seuG)], add.cell.ids = dirs)
+
+  seu[["percent.mt"]] <- PercentageFeatureSet(seu, pattern = "^MT-")
+  seu$logUMI<-log10(seu$nCount_RNA)
+  VlnPlot(seu, features = c("nFeature_RNA", "nCount_RNA", "logUMI", "percent.mt"), ncol = 4, pt.size = 0)
+  lthresh<-1000
+  hthresh<-50000
+  #glthresh<-700
+  seu<-seu[,seu$nCount_RNA>lthresh]
+  seu<-seu[,seu$nCount_RNA<hthresh]
+  #seu<-seu[,seu$nFeature_RNA>glthresh]
+  seu<-seu[,seu$percent.mt<20]
+  seu
+})
+
+## Get total cell numbers before any filtering
+ncol(seus[[1]])+ncol(seus[[2]])+ncol(seus[[3]])+ncol(seus[[4]])+ncol(seus[[5]])+ncol(seus[[6]])
+
+rm(seu, seuG)
+gc()
+
+```
+
+## Add deidentified sample information and fix timepoint labels 
+```{r}
+# Fix orig.ident
+seus[[1]]$orig.ident <- "Pt5"
+seus[[2]]$orig.ident <- "Pt5"
+seus[[3]]$orig.ident <- "Pt4"
+seus[[4]]$orig.ident <- "Pt9"
+seus[[5]]$orig.ident <- "Pt2"
+seus[[6]]$orig.ident <- "Pt6"
+
+# Add sample/timepoint info
+seus <- lapply(seus, function(seu){
+  seu$sample <- substr(rownames(seu@meta.data), 1, nchar(rownames(seu@meta.data))-19)
+  seu$timepoint <- seu$sample
+  seu
+})
+
+# Rename and collapse Pt5 D177 into one timepoint
+seus[[2]]$timepoint <- "Pt5_D177_2"
+
+# Rename and collapse other Pt5 cell fraction timepoints into one timepoint each
+seus[[1]]$timepoint <- paste0("Pt5_", seus[[1]]$timepoint)
+seus[[1]]$timepoint <- substr(seus[[1]]$timepoint, 1, nchar(seus[[1]]$timepoint)-1)
+table(seus[[1]]$timepoint)
+
+# Deidentify patient info in timepoint and change PDEP/REL to PREINF
+seus <- lapply(seus, function(seu){
+  seu$timepoint <- substr(seu$timepoint, 5, nchar(seu$timepoint))
+  seu$timepoint <- paste0(seu$orig.ident, "_", seu$timepoint)
+  seu$timepoint <- gsub("PDEP", "PREINF", seu$timepoint)
+  seu$timepoint <- gsub("REL", "PREINF", seu$timepoint)
+  seu$timepoint <- gsub("PRE", "01PRE", seu$timepoint)
+  seu
+})
+```
+
+## Add souporcell genotyping and remove doublets by genotype (0/1 or 1/0)
+```{r}
+# souporcell workflow (https://github.com/wheaton5/souporcell)
+seus<-lapply(as.list(1:length(DATA_DIRS)), function(i){
+  DATA_DIR<-DATA_DIRS[i]
+  dirs<-list.files(DATA_DIR)
+  merge<-dirs[grep("merge", dirs)]
+  ctsv<-read.table(file.path(DATA_DIR, merge, "souporcell_2", "clusters.tsv"), header = T)
+  rownames(ctsv)<-ctsv$barcode
+  seus[[i]]<-seus[[i]][,Cells(seus[[i]]) %in% ctsv$barcode]
+  ctsv<-ctsv[Cells(seus[[i]]),]
+  cs<-as.matrix(ctsv[,colnames(ctsv)[grep("^cluster", colnames(ctsv))]])
+  pc<-princomp(log(cs*-1))
+  pcv<-as.data.frame(pc$scores)
+  pcv$status<-ctsv$status
+  pcv$assignment<-ctsv$assignment
+  rownames(seus[[i]]@meta.data)
+  pcv$barcode<-ctsv$barcode
+  # ggplot(pcv, aes(x=Comp.1, y=Comp.2, color=assignment))+geom_point(size=0.2)+scale_color_manual(values=pals::glasbey())
+  seus[[i]]$geno<-"Not_Calculated"
+  seus[[i]]@meta.data[pcv$barcode,]$geno<-pcv$assignment
+  seus[[i]]@meta.data<-seus[[i]]@meta.data[Cells(seus[[i]]),]
+  seus[[i]]<-seus[[i]][,!grepl("/", seus[[i]]$geno)] # Removes doublets ("0/1" or "1/0")
+  seus[[i]]
+})
+
+```
+
+## Add cell type annotation with viewmastR
+```{r}
+rna<-readRDS(file.path("~/singlecell/public_datasets/200604_cds_RNA.RDS"))
+
+seus<-lapply(seus, function(seu){
+  seu <- NormalizeData(seu, normalization.method = "LogNormalize", scale.factor = 10000)
+  seu <- FindVariableFeatures(seu, selection.method = "vst", nfeatures = 10000)
+  seu <- ScaleData(seu)
+  seu <- RunPCA(seu, features = VariableFeatures(object = seu), npcs = 50)
+  ElbowPlot(seu, 50)
+  seu <- FindNeighbors(seu, dims = 1:40)
+  seu <- FindClusters(seu, resolution = 0.5)
+  seu <- RunUMAP(seu, dims = 1:40)
+  cds<-seurat_to_monocle3(seu)
+  vg<-common_variant_genes(cds, rna, top_n = 5000)
+  cds<-viewmastR(cds, rna, ref_celldata_col = "BioClassification", selected_genes = vg, verbose=T, FUNC = "softmax_regression", tf_idf = F)
+  plot_cells(cds, label_cell_groups = F, color_cells_by = "smr_celltype", cell_size = 0.6)+scale_color_manual(values = as.character(pals::polychrome()))
+  df<-data.frame(old=levels(factor(rna$BioClassification)), new=c("01_HSC", "02_Early_Erythroid", "03_Late_Erythroid", "04_Myeloid_Progenitor", "04_Myeloid_Progenitor", "05_Lymphoid_Progenitor", "04_Myeloid_Progenitor", "04_Myeloid_Progenitor", "06_pDC", "07_cDC", "08_CD14_Monocyte", "08_CD14_Monocyte", "09_CD16_Monocyte", "10_Other", "05_Lymphoid_Progenitor", "11_Pre_B", "12_B", "13_Plasma", "14_T", "14_T","14_T","14_T","14_T","14_T","15_NK", "10_Other"))
+  cds$celltype<-factor(cds$smr_celltype)
+  levels(cds$celltype)<-df$new[match(levels(cds$celltype), df$old)]
+  seu$celltype<-factor(as.character(cds$celltype))
+  if(length(Assays(seu))>1){
+    DefaultAssay(seu) <- "ADT"
+  seu <- NormalizeData(seu, normalization.method = "CLR", margin = 2)
+  DefaultAssay(seu) <- "RNA"
+  }
+  Idents(seu)<-seu$celltype
+  seu
+})
+
+## This saves a list of 6 Seurat objects
+# saveRDS(seus, file.path("/fh/fast/bleakley_m/users/HA-1/leukemia escape/cds/all_myeloid_celltype_geno_prescrublet.RDS"))
+```
+
+## Run scrublet 
+```{r}
+seus <- readRDS(file.path("/fh/fast/bleakley_m/users/HA-1/leukemia escape/cds/all_myeloid_celltype_geno_prescrublet.RDS"))
+
+seus<-lapply(seus, function(seu){ 
+  ds<-scrublet(seu, split_by = "orig.ident", return_results_only = T)
+  seu$doublet_scores<-ds$doublet_scores 
+  seu 
+})
+
+#saveRDS(seus, file.path("fh/fast/bleakley_m/users/HA-1/leukemia escape/cds/all_myeloid_celltype_geno_postscrublet.RDS"))
+```
+
+## Read in RDS with scrublet and visualize each at threshold <0.1
+```{r}
+seus <- readRDS(file.path("/fh/fast/bleakley_m/users/HA-1/leukemia escape/cds/all_myeloid_celltype_geno_postscrublet.RDS"))
+```
+
+## Merge into one Seurat object
+```{r}
+pts <- c("Pt5", "Pt5", "Pt4", "Pt9", "Pt2", "Pt6")
+seu <- merge(x = seus[[1]], y = seus[2:6], add.cell.ids = pts)
+
+# Check labels
+table(seu$orig.ident, seu$timepoint)
+
+# Make new metadata sample based on orig.ident
+seu$sample <- seu$orig.ident
+```
+
+## Remove Pt9 D180--outlier
+```{r}
+seu <- seu[,!seu$timepoint=="Pt9_D180"]
+```
+
+## Do dimensionality reduction and clustering
+```{r}
+# Set parameters
+scale_factor = 10000
+nfeatures = 3000
+nPCs = 50
+uDim = 40
+cresolution = 0.5
+
+# Run
+DefaultAssay(seu)<-"RNA"
+seu <- NormalizeData(seu, normalization.method = "LogNormalize", scale.factor = scale_factor)
+seu <- FindVariableFeatures(seu, selection.method = "vst", nfeatures = nfeatures)
+seu <- ScaleData(seu)
+seu <- RunPCA(seu, features = VariableFeatures(object = seu), npcs = nPCs)
+ElbowPlot(seu, nPCs)
+seu <- RunUMAP(seu, dims = 1:30, min.dist = 0.5)
+
+# Visualize key metadata
+DimPlot_scCustom(seu, group.by = "timepoint")
+DimPlot_scCustom(seu, group.by = "sample")
+DimPlot_scCustom(seu, group.by = "celltype", colors_use = mcols2)
+DimPlot_scCustom(seu, group.by = "geno", colors_use = c("gold", "darkblue"))
+```
+
+## Visualize and remove doublets
+```{r}
+# Visualize to determine cutoff
+FeaturePlot_scCustom(seu, features = "doublet_scores")
+RidgePlot(seu, features = "doublet_scores")
+
+# Define and remove doublets
+seu$sf_doublet<-seu$doublet_scores>0.08
+seu<-seu[,!seu$sf_doublet]
+```
+
+## Redo dimensionality reduction and clustering
+```{r}
+# Set parameters
+scale_factor = 10000
+nfeatures = 3000
+nPCs = 50
+uDim = 40
+cresolution = 0.5
+
+# Run
+DefaultAssay(seu)<-"RNA"
+seu <- NormalizeData(seu, normalization.method = "LogNormalize", scale.factor = scale_factor)
+seu <- FindVariableFeatures(seu, selection.method = "vst", nfeatures = nfeatures)
+seu <- ScaleData(seu)
+seu <- RunPCA(seu, features = VariableFeatures(object = seu), npcs = nPCs)
+ElbowPlot(seu, nPCs)
+seu <- FindNeighbors(seu, dims = 1:40)
+seu <- FindClusters(seu, resolution = cresolution)
+seu <- RunUMAP(seu, dims = 1:30, min.dist = 0.5)
+
+# Visualize key metadata
+DimPlot_scCustom(seu, group.by = "seurat_clusters", colors_use = pals::glasbey())
+DimPlot_scCustom(seu, group.by = "timepoint")
+DimPlot_scCustom(seu, group.by = "sample")
+DimPlot_scCustom(seu, group.by = "celltype", colors_use = mcols2)
+DimPlot_scCustom(seu, group.by = "geno", colors_use = c("gold", "darkblue"))
+```
+
+## Fix genotype (if in normal clusters = donor)
+```{r}
+# Souporcell assigns numerical value to genotype on a per run basis. We need to harmonize the assignment for downstream analysis. 
+DimPlot_scCustom(seu, group.by = "geno", colors_use = c("gold", "darkblue"))
+DimPlot_scCustom(seu, group.by = "geno", split.by = "sample", colors_use = c("gold", "darkblue"), split_seurat = T)
+DimPlot_scCustom(seu[, seu$sample=="Pt2"], group.by = "geno", split.by = "timepoint", colors_use = c("gold", "darkblue"))
+
+# Clinical chimerism for all patients showed donor CD3 >> recipient CD3. In most cases, T cells appear to be majority geno = "0" (donor = "0", recipient = "1")
+table(seu[, seu$celltype=="14_T"]$geno, seu[, seu$celltype=="14_T"]$timepoint)
+
+# So if T cells are majority geno = "1" then the geno assignment is flipped (donor = "1", recipient = "0")
+
+########################################################
+### REPLACE WITH IF/ELSE CODE THAT WILL APPLY TO ALL ###
+### but Pt5 D56_1 and D56_2 are the only ones flipped ##
+########################################################
+
+seu$assign <- seu$geno
+seu$assign[seu$timepoint %in% c("Pt5_D56_1", "Pt5_D56_2") & seu$assign=="1"] <- "donor"
+seu$assign[seu$timepoint %in% c("Pt5_D56_1", "Pt5_D56_2") & seu$assign=="0"] <- "recipient"
+table(seu$assign, seu$timepoint)
+seu$geno[seu$timepoint %in% c("Pt5_D56_1", "Pt5_D56_2") & seu$assign=="donor"] <- "0"
+seu$geno[seu$timepoint %in% c("Pt5_D56_1", "Pt5_D56_2") & seu$assign=="recipient"] <- "1"
+table(seu[, seu$celltype=="14_T"]$geno, seu[, seu$celltype=="14_T"]$timepoint)
+seu$assign <- NULL
+
+# Visualize
+DimPlot_scCustom(seu, group.by = "geno", split.by = "sample", colors_use = c("gold", "darkblue"), split_seurat = T)
+
+#saveRDS(seu, file.path("/fh/fast/bleakley_m/users/HA-1/leukemia escape/cds/all_myeloid_singleseu_scrubbed_genofixed.RDS"))
+```
+
+## Label malignant. We will first visualize clusters, genotype, and celltypes. Malignant cells are cells of recipient origin (geno = "1") with distinct gene expression 
+```{r}
+seu <- readRDS(file.path("/fh/fast/bleakley_m/users/HA-1/leukemia escape/cds/all_myeloid_singleseu_scrubbed_genofixed.RDS"))
+
+# Visualize 
+DimPlot_scCustom(seu, group.by = "seurat_clusters", colors_use = pals::glasbey(), label = T)|DimPlot_scCustom(seu, group.by = "celltype", colors_use = mcols2)|DimPlot_scCustom(seu, group.by = "geno", colors_use = c("gold", "darkblue"))
+
+# Make df of clusters by genotype and pull vector of recipient-predominant cluster numbers (geno=1)
+clusters_geno <- as.data.frame.matrix(table(seu$seurat_clusters, seu$geno))
+clusters_geno$seurat_clusters <- rownames(clusters_geno)
+clusters_geno <- clusters_geno %>% 
+  rename(
+    recipient = "1",
+    donor = "0"
+    )
+clusters_recip <- dplyr::filter(clusters_geno, recipient > donor)
+r_clusters <- clusters_recip$seurat_clusters
+
+# Make new "malignant" meta.data from celltype and assign malignant to cells with recipient genotype (geno = 1) in recipient-predominant clusters
+seu$malignant <- seu$celltype
+seu$malignant[seu$geno=="1" & seu$seurat_clusters %in% r_clusters] <- "malignant"
+DimPlot_scCustom(seu, group.by = "malignant", colors_use = mcols2)
+
+# Then change "malignant" to patient ID
+seu$malignant[seu$malignant=="malignant" & seu$sample=="Pt2"] <- "Pt2"
+seu$malignant[seu$malignant=="malignant" & seu$sample=="Pt4"] <- "Pt4"
+seu$malignant[seu$malignant=="malignant" & seu$sample=="Pt5"] <- "Pt5"
+seu$malignant[seu$malignant=="malignant" & seu$sample=="Pt6"] <- "Pt6"
+seu$malignant[seu$malignant=="malignant" & seu$sample=="Pt9"] <- "Pt9"
+
+# Check # cells called malignant 
+table(seu$malignant)
+DimPlot_scCustom(seu, group.by = "malignant", colors_use = mcols2, label = T)
+```
+
+## Assign Nml_equivalents: donor origin cells of same celltypes as malignant cells in same patient
+```{r}
+# Add new meta.data "compare" based on "malignant"
+seu$compare <- seu$malignant
+
+# Identify malignant celltypes and filter out differentiated nonmyeloid cell types 
+pts <- unique(seu$sample)
+malignant_celltypes <- unique(seu$celltype[seu$malignant %in% pts])
+diff_nonmyeloid <- c("11_Pre_B", "12_B", "13_Plasma", "14_T", "15_NK")
+malignant_celltypes <- malignant_celltypes[!malignant_celltypes %in% diff_nonmyeloid]
+
+# Assign normal equivalents with donor genotype (geno = 0) individually
+Pt2_celltypes <- malignant_celltypes[malignant_celltypes %in% unique(seu$celltype[seu$malignant=="Pt2"])] 
+seu$compare[seu$sample=="Pt2" & seu$geno=="0" & seu$celltype %in% Pt2_celltypes]<-"Nml_equivalents"
+
+Pt4_celltypes <- malignant_celltypes[malignant_celltypes %in% unique(seu$celltype[seu$malignant=="Pt4"])] 
+seu$compare[seu$sample=="Pt4" & seu$geno=="0" & seu$celltype %in% Pt4_celltypes]<-"Nml_equivalents"
+
+Pt5_celltypes <- malignant_celltypes[malignant_celltypes %in% unique(seu$celltype[seu$malignant=="Pt5"])] 
+seu$compare[seu$sample=="Pt5" & seu$geno=="0" & seu$celltype %in% Pt5_celltypes]<-"Nml_equivalents"
+
+Pt6_celltypes <- malignant_celltypes[malignant_celltypes %in% unique(seu$celltype[seu$malignant=="Pt6"])] 
+seu$compare[seu$sample=="Pt6" & seu$geno=="0" & seu$celltype %in% Pt6_celltypes]<-"Nml_equivalents"
+
+Pt9_celltypes <- malignant_celltypes[malignant_celltypes %in% unique(seu$celltype[seu$malignant=="Pt9"])] 
+seu$compare[seu$sample=="Pt9" & seu$geno=="0" & seu$celltype %in% Pt9_celltypes]<-"Nml_equivalents"
+
+# Visualize
+DimPlot_scCustom(seu, group.by = "compare", split.by = "sample", colors_use = mcols3, split_seurat = T)
+
+# Save with all added meta.data
+# saveRDS(seu, file.path("/fh/fast/bleakley_m/users/HA-1/leukemia escape/cds/all_myeloid_singleseu_scrubbed_genofixed_malignantannot.RDS"))
+```
+
+
+### Appendix
+```{r Appendix,echo=FALSE}
+sessionInfo()
+getwd()
+```
+
+
+
